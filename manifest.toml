@@ -1,4 +1,4 @@
 name = "Secret Word"
-version = "5"
+version = "5.1"
 description = "A guessing game for 2 or more, built to try out playing with your eyes closed: each round one player chooses a secret word on their own screen, and only its fingerprint is shared. The others guess letters, the chooser's own copy answers, and the word is checked against its fingerprint at the end. Made by Claude in PDA SEASIDE (November 2026) as a working example for SunkissedButterfly's hidden-information games."
 source_code_url = "https://github.com/AETHER-ENGINEERS/secret-word"
