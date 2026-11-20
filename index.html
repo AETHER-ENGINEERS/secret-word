@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Secret Word</title>
+<script src="webxdc.js"></script>
+<style>
+  :root { --bg:#14111c; --card:#1f1a2b; --ink:#efe8ff; --muted:#a99fc0; --accent:#c79bff; --good:#7fe0a8; --bad:#ff8f9f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, sans-serif; padding:16px; }
+  main { max-width:560px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .muted { color:var(--muted); }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin:12px 0; }
+  .word { font:600 28px/1.2 ui-monospace, monospace; letter-spacing:.35em; margin:8px 0; word-break:break-all; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input { background:#2a2338; color:var(--ink); border:1px solid #463b5c; border-radius:8px; padding:8px 10px; font:inherit; }
+  button { background:var(--accent); color:#1a1225; border:0; border-radius:8px; padding:8px 14px; font:600 14px system-ui; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  .closed { font-size:18px; }
+  .ok { color:var(--good); } .no { color:var(--bad); }
+  ul { margin:6px 0 0; padding-left:18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Secret Word</h1>
+  <div class="muted">One player chooses a word on their own screen; only its fingerprint is shared. The others guess letters.
+    The chooser's own copy answers each guess, and at the end the word is shown and checked against its fingerprint.</div>
+  <div id="app"></div>
+</main>
+<script>
+// ---------- a small SHA-256 (crypto.subtle isn't there on a plain-http LAN address) ----------
+function sha256(ascii) {
+  const rr = (v, a) => (v >>> a) | (v << (32 - a));
+  const words = [], bitLen = ascii.length * 8;
+  let hash = [], k = [], pc = 0;
+  const isC = {};
+  for (let c = 2; pc < 64; c++) if (!isC[c]) { for (let i = 0; i < 313; i += c) isC[i] = c; hash[pc] = (Math.pow(c, .5) * 4294967296) | 0; k[pc++] = (Math.pow(c, 1 / 3) * 4294967296) | 0; }
+  hash = hash.slice(0, 8);
+  ascii += "\x80";
+  while ((ascii.length % 64) - 56) ascii += "\x00";
+  for (let i = 0; i < ascii.length; i++) words[i >> 2] |= ascii.charCodeAt(i) << (((3 - i) % 4) * 8);
+  words[words.length] = (bitLen / 4294967296) | 0;
+  words[words.length] = bitLen;
+  for (let j = 0; j < words.length;) {
+    const w = words.slice(j, (j += 16)), old = hash;
+    hash = hash.slice(0, 8);
+    for (let i = 0; i < 64; i++) {
+      const w15 = w[i - 15], w2 = w[i - 2], a = hash[0], e = hash[4];
+      const t1 = hash[7] + (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25)) + ((e & hash[5]) ^ (~e & hash[6])) + k[i] +
+        (w[i] = i < 16 ? w[i] : (w[i - 16] + (rr(w15, 7) ^ rr(w15, 18) ^ (w15 >>> 3)) + w[i - 7] + (rr(w2, 17) ^ rr(w2, 19) ^ (w2 >>> 10))) | 0);
+      const t2 = (rr(a, 2) ^ rr(a, 13) ^ rr(a, 22)) + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+      hash = [(t1 + t2) | 0].concat(hash);
+      hash[4] = (hash[4] + t1) | 0;
+    }
+    for (let i = 0; i < 8; i++) hash[i] = (hash[i] + old[i]) | 0;
+  }
+  return hash.slice(0, 8).map((h) => ("00000000" + (h >>> 0).toString(16)).slice(-8)).join("");
+}
+
+const me = webxdc.selfAddr, myName = webxdc.selfName;
+const MISSES = 6;
+const S = { players: [], names: {}, rounds: [], ready: false };
+const round = () => S.rounds[S.rounds.length - 1] || null;
+const nameOf = (a) => S.names[a] || a;
+const secretKey = (n) => "secret:" + n;
+const mySecret = (n) => { try { return JSON.parse(localStorage.getItem(secretKey(n)) || "null"); } catch (e) { return null; } };
+
+function shownWord(r) {
+  return Array.from({ length: r.len }, (_, i) => (r.found[i] ? r.found[i] : "_")).join(" ");
+}
+function misses(r) { return r.guesses.filter((g) => g.answered && !g.positions.length).length; }
+function solved(r) { return r.len > 0 && r.found.filter(Boolean).length === r.len; }
+function over(r) { return r.revealed || solved(r) || misses(r) >= MISSES; }
+function guessers(r) { return S.players.filter((p) => p !== r.setter); }
+/** whose guess is next: guessers in turn, one guess each */
+function nextGuesser(r) { const g = guessers(r); return g.length ? g[r.guesses.length % g.length] : null; }
+
+// a refused guess (sent from an older copy, or by hand) still named the chooser; the chooser's copy then says again
+// whose guess it really is, so the right player wakes
+let refusedGuess = false;
+function apply(p, from) {
+  if (!p || typeof p !== "object") return;
+  refusedGuess = false;
+  if (p.type === "turn") return;
+  if (p.type === "join") {
+    if (!S.players.includes(p.addr)) S.players.push(p.addr);
+    S.names[p.addr] = p.name || p.addr;
+  } else if (p.type === "round") {
+    const r = round();
+    if (r && !over(r)) return console.warn("[secret-word] rejected round: a round is still going");
+    if (!S.players.includes(p.setter)) return console.warn("[secret-word] rejected round: the chooser hasn't joined");
+    S.rounds.push({ n: p.n, setter: p.setter, hash: "", len: 0, found: [], guesses: [], revealed: null, verified: null });
+  } else if (p.type === "commit") {
+    const r = round();
+    if (!r || r.n !== p.n || from !== r.setter || r.hash) return console.warn("[secret-word] rejected commit: not the chooser's to lock in");
+    r.hash = String(p.hash); r.len = Math.max(1, Math.min(24, p.len | 0)); r.found = Array(r.len).fill("");
+  } else if (p.type === "guess") {
+    const r = round();
+    const letter = String(p.letter || "").toUpperCase();
+    if (!r || !r.hash || over(r)) return console.warn("[secret-word] rejected guess: no word is waiting");
+    if (from === r.setter) return console.warn("[secret-word] rejected guess: the chooser doesn't guess");
+    if (!/^[A-Z]$/.test(letter)) return console.warn("[secret-word] rejected guess: one letter, A to Z");
+    if (r.guesses.some((g) => g.letter === letter)) return (refusedGuess = true), console.warn("[secret-word] rejected guess: " + letter + " was already guessed");
+    if (nextGuesser(r) !== from) return (refusedGuess = true), console.warn("[secret-word] rejected guess: it's " + nameOf(nextGuesser(r)) + "'s guess");
+    r.guesses.push({ letter, by: from, answered: false, positions: [] });
+  } else if (p.type === "answer") {
+    const r = round();
+    if (!r || from !== r.setter) return;
+    const g = r.guesses.find((x) => x.letter === p.letter && !x.answered);
+    if (!g) return;
+    g.answered = true; g.positions = (p.positions || []).filter((i) => i >= 0 && i < r.len);
+    for (const i of g.positions) r.found[i] = g.letter;
+  } else if (p.type === "reveal") {
+    const r = round();
+    if (!r || from !== r.setter || r.revealed) return;
+    r.revealed = String(p.word || "");
+    // (version 1 to 4 sent a longer fingerprint whose first 64 characters are the real one)
+    r.verified = sha256(p.salt + ":" + r.revealed) === r.hash.slice(0, 64);
+  }
+}
+
+// the chooser's own copy answers guesses and reveals the word at the end; nobody else can, because only it knows
+function answerAsChooser() {
+  const r = round();
+  if (!S.ready || !r || r.setter !== me || !r.hash) return;
+  const s = mySecret(r.n);
+  if (!s) return;
+  const pending = r.guesses.find((g) => !g.answered);
+  if (pending) {
+    const positions = [];
+    for (let i = 0; i < s.word.length; i++) if (s.word[i] === pending.letter) positions.push(i);
+    const after = { ...r, found: r.found.slice(), guesses: r.guesses.map((g) => (g === pending ? { ...g, answered: true, positions } : g)) };
+    positions.forEach((i) => (after.found[i] = pending.letter));
+    const ends = solved(after) || misses(after) >= MISSES;
+    const nxt = ends ? null : nextGuesser(after);
+    webxdc.sendUpdate({ payload: { type: "answer", n: r.n, letter: pending.letter, positions },
+      info: `${pending.letter}: ${positions.length ? "yes, " + positions.length : "no"}`,
+      ...(nxt ? { notify: { [nxt]: `Your guess (${shownWord(after)})` } } : {}) }, "");
+    return;
+  }
+  if (refusedGuess && !over(r)) {
+    refusedGuess = false;
+    const nxt = nextGuesser(r);
+    if (nxt) webxdc.sendUpdate({ payload: { type: "turn", n: r.n }, info: `Still ${nameOf(nxt)}'s guess`, notify: { [nxt]: `Your guess (${shownWord(r)}); already guessed: ${r.guesses.map((g) => g.letter).join(" ")}` } }, "");
+    return;
+  }
+  if (over(r) && !r.revealed) {
+    webxdc.sendUpdate({ payload: { type: "reveal", n: r.n, word: s.word, salt: s.salt }, info: `The word was ${s.word}`,
+      notify: { "*": `The word was ${s.word}` } }, "");
+  }
+}
+
+// ---------- what each player sees ----------
+const app = document.getElementById("app");
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function render() {
+  const joined = S.players.includes(me);
+  const r = round();
+  let h = `<div class="card"><b>Players:</b> ${S.players.map((a) => esc(nameOf(a)) + (a === me ? " (you)" : "")).join(", ") || "nobody yet"}`;
+  if (!joined) h += `<div class="row" style="margin-top:8px"><button id="join">Join the game</button></div>`;
+  h += `</div>`;
+  if (!r || (over(r) && r.revealed !== null)) {
+    if (r) h += finished(r);
+    if (joined && S.players.length >= 2) {
+      const setter = nextSetter();
+      h += `<div class="card"><div class="row"><button id="start">Start round ${S.rounds.length + 1}</button>
+        <span class="muted">${esc(nameOf(setter))} chooses the word${setter === me ? " (that's you)" : ""}</span></div></div>`;
+    } else if (joined) h += `<div class="card muted">Waiting for a second player to join.</div>`;
+  } else if (!r.hash) {
+    if (r.setter === me) {
+      h += `<div class="card"><b>Round ${r.n}: you choose the word.</b> Only you see this. Letters A to Z, 2 to 24 of them.
+        <div class="row" style="margin-top:8px"><input id="secret" aria-label="Secret word" placeholder="Secret word" autocomplete="off">
+        <button id="lock">Lock it in</button></div></div>`;
+    } else {
+      h += `<div class="card closed">🙈 ${esc(nameOf(r.setter))} is choosing a word… your eyes are closed until it's locked in.</div>`;
+    }
+  } else {
+    const nxt = nextGuesser(r);
+    const pending = r.guesses.find((g) => !g.answered);
+    h += `<div class="card"><b>Round ${r.n}</b> · ${esc(nameOf(r.setter))}'s word, ${r.len} letters
+      <div class="word">${shownWord(r)}</div>
+      <div>Missed: ${r.guesses.filter((g) => g.answered && !g.positions.length).map((g) => g.letter).join(" ") || "none"} (${misses(r)} of ${MISSES})</div>
+      <div>Guessed: ${r.guesses.map((g) => g.letter).join(" ") || "nothing yet"}</div>`;
+    if (r.setter === me) {
+      const s = mySecret(r.n);
+      h += `<div class="muted" style="margin-top:6px">Your word (only you see it): <b>${esc(s ? s.word : "?")}</b>. Your copy answers each guess.</div>`;
+    }
+    if (over(r)) h += `<div style="margin-top:6px">${solved(r) ? "Solved!" : "Out of guesses."} Waiting for ${esc(nameOf(r.setter))}'s copy to show the word.</div>`;
+    else if (pending) h += `<div style="margin-top:6px">${esc(nameOf(pending.by))} guessed ${pending.letter}; waiting for ${esc(nameOf(r.setter))}'s copy to answer.</div>`;
+    else if (nxt === me) h += `<div class="row" style="margin-top:8px"><b>Your guess:</b> <input id="letter" aria-label="Letter" placeholder="Letter" maxlength="1" size="3" autocomplete="off"><button id="guess">Guess</button></div>`;
+    else h += `<div style="margin-top:6px">${esc(nameOf(nxt))}'s guess.</div>`;
+    h += `</div>`;
+  }
+  app.innerHTML = h;
+  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
+  on("join", () => webxdc.sendUpdate({ payload: { type: "join", addr: me, name: myName }, info: `${myName} joined Secret Word` }, ""));
+  on("start", () => { const setter = nextSetter(); webxdc.sendUpdate({ payload: { type: "round", n: S.rounds.length + 1, setter }, info: `Round ${S.rounds.length + 1}: ${nameOf(setter)} chooses a word`, notify: { [setter]: "Choose a secret word: type it on your own screen and lock it in" } }, ""); });
+  on("lock", lock);
+  on("guess", guess);
+  const sec = document.getElementById("secret"); if (sec) sec.onkeydown = (e) => { if (e.key === "Enter") lock(); };
+  const let_ = document.getElementById("letter"); if (let_) let_.onkeydown = (e) => { if (e.key === "Enter") guess(); };
+}
+function nextSetter() { const last = round(); if (!last) return S.players[0]; const i = S.players.indexOf(last.setter); return S.players[(i + 1) % S.players.length]; }
+function finished(r) {
+  return `<div class="card">Round ${r.n}: ${esc(nameOf(r.setter))}'s word was <b>${esc(r.revealed)}</b>
+    ${r.verified ? '<span class="ok">✓ matches its fingerprint</span>' : '<span class="no">✗ doesn\'t match the fingerprint locked in at the start</span>'}
+    <div>${solved(r) ? "The guessers found it" : "The word stayed hidden"} with ${misses(r)} miss${misses(r) === 1 ? "" : "es"}.</div></div>`;
+}
+function lock() {
+  const r = round();
+  const el = document.getElementById("secret");
+  const word = String(el ? el.value : "").trim().toUpperCase();
+  if (!/^[A-Z]{2,24}$/.test(word)) return console.warn("[secret-word] rejected word: letters A to Z only, 2 to 24 of them");
+  const salt = Array.from({ length: 4 }, () => Math.random().toString(36).slice(2)).join("");
+  localStorage.setItem(secretKey(r.n), JSON.stringify({ word, salt }));
+  const first = guessers(r)[0];
+  webxdc.sendUpdate({ payload: { type: "commit", n: r.n, len: word.length, hash: sha256(salt + ":" + word) },
+    info: `${myName} locked in a ${word.length}-letter word`, notify: first ? { [first]: `Guess a letter: ${word.length} letters` } : undefined }, "");
+}
+function guess() {
+  const r = round();
+  const el = document.getElementById("letter");
+  const letter = String(el ? el.value : "").trim().toUpperCase();
+  if (!/^[A-Z]$/.test(letter)) return console.warn("[secret-word] rejected guess: one letter, A to Z");
+  // checked here first, so a move the game would refuse is never sent (and never wakes anyone)
+  if (r.guesses.some((g) => g.letter === letter)) return console.warn("[secret-word] rejected guess: " + letter + " was already guessed (guessed so far: " + r.guesses.map((g) => g.letter).join(" ") + ")");
+  if (nextGuesser(r) !== me) return console.warn("[secret-word] rejected guess: it's " + nameOf(nextGuesser(r)) + "'s guess");
+  webxdc.sendUpdate({ payload: { type: "guess", n: r.n, letter }, info: `${myName} guessed ${letter}`, notify: { [r.setter]: `${myName} guessed ${letter}` } }, "");
+}
+
+webxdc.setUpdateListener((u) => {
+  // who sent it: a join names itself; everything else is checked against the sender's address carried in the payload
+  apply(u.payload, u.payload && (u.payload.addr || u.payload.from));
+  if (u.serial === u.max_serial) { S.ready = true; render(); answerAsChooser(); }
+}, 0).then(() => { S.ready = true; render(); answerAsChooser(); });
+
+// every update carries its sender, so a copy can't be fooled about who chose or who guessed
+const send = webxdc.sendUpdate.bind(webxdc);
+webxdc.sendUpdate = (u, d) => send({ ...u, payload: { ...u.payload, from: me } }, d);
+render();
+</script>
+</body>
+</html>
